@@ -1,120 +1,170 @@
-#!/usr/bin/env python3
-"""Combined test script for **Bosch BME280** (env-sensor) and
-**AE-BNO055-BO (Bosch BNO055)** 9-axis sensor-fusion module on a Raspberry Pi.
-
-Reads **temperature / humidity / pressure** from the BME280 and
-**raw acceleration** from the BNO055 using the same I²C bus, and prints
-both sets once per second with detailed debug output.
-
-Prerequisites (same venv as individual tests)
---------------------------------------------
-```bash
-pip3 install --upgrade \
-    adafruit-circuitpython-bme280 \
-    adafruit-circuitpython-bno055 \
-    adafruit-blinka RPi.GPIO
-```
-
-If the BNO055 ADR pin is tied **HIGH**, change `BNO055_I2C_ADDR` to
-`0x29`. For the BME280, swap `BME280_I2C_ADDR` between `0x76` and `0x77`
-as required.
-"""
-
-from __future__ import annotations
-
-import sys
+import pigpio
 import time
-import importlib.metadata as imm
-
-import board  # noqa: E402
-import busio  # noqa: E402
+import board
+import csv
+import threading
+import collections
+from datetime import datetime
 from adafruit_bme280 import basic as adafruit_bme280  # noqa: E402
 from adafruit_bno055 import BNO055_I2C  # noqa: E402
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Debug helper
-# ──────────────────────────────────────────────────────────────────────────────
+# 実行時間
+RUN_TIME = 10  # seconds
 
-DEBUG_PREFIX = "[DEBUG]"
+# I2C定義
+SDA_PIN = 2
+SCL_PIN = 3
+I2C_BUS_ID = 1
+BME280_I2C_ADDR = 0x76
+BNO055_I2C_ADDR = 0x28
 
-def _debug(msg: str) -> None:
-    """Print *msg* to stderr with a common prefix."""
-    print(f"{DEBUG_PREFIX} {msg}", file=sys.stderr)
+class SensorReader:
+    def __init__(self, pi, freq=100, output_file="sensor_log.csv", flush_interval=1.0):
+        self.pi = pi
+        self.freq = freq
+        self.tick = 0
+        self.output_file = output_file
+        self.flush_interval = flush_interval
+        self.running = True
 
-# ──────────────────────────────────────────────────────────────────────────────
-# I²C configuration constants (BCM numbering)
-# ──────────────────────────────────────────────────────────────────────────────
+        self.buffer = collections.deque()
+        self.lock = threading.Lock()
 
-SDA_PIN: int = 2              # GPIO2 (physical pin 3)
-SCL_PIN: int = 3              # GPIO3 (physical pin 5)
-I2C_BUS_ID: int = 1           # Default I²C bus on Raspberry Pi
+        # I2C初期化
+        i2c = board.I2C()
+        self.bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=BME280_I2C_ADDR)
+        self.bno055 = BNO055_I2C(i2c, address=BNO055_I2C_ADDR)
 
-BME280_I2C_ADDR: int = 0x76   # 0x77 if CSB pin HIGH
-BNO055_I2C_ADDR: int = 0x28   # 0x29 if ADR pin HIGH
+        # 最新センサデータ（スレッド間共有）
+        self.latest = {
+            "pressure": None,
+            "temperature": None,
+            "accel": (None, None, None),
+            "gyro": (None, None, None),
+            "euler": (None, None, None)
+        }
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Main logic
-# ──────────────────────────────────────────────────────────────────────────────
+        self.data_lock = threading.Lock()
 
-def main() -> None:
-    """Continuously read both sensors with debug output."""
-    # Diagnostics: show library versions
-    for pkg in ("adafruit-circuitpython-bme280", "adafruit-circuitpython-bno055"):
+        # センサ読み取りスレッド起動
+        self.bme_thread = threading.Thread(target=self.read_bme280_loop)
+        self.bno_thread = threading.Thread(target=self.read_bno055_loop)
+        self.bme_thread.start()
+        self.bno_thread.start()
+
+        # GPIO設定とPWM開始
+        self.output_pin = 18
+        self.input_pin = 17
+        self.pi.set_mode(self.output_pin, pigpio.OUTPUT)
+        self.pi.set_mode(self.input_pin, pigpio.INPUT)
+        self.pi.hardware_PWM(self.output_pin, freq, 500000)
+
+        # 割込み登録
+        self.cb = self.pi.callback(self.input_pin, pigpio.RISING_EDGE, self.read_sensors)
+
+        # 書き出しスレッド起動
+        self.writer_thread = threading.Thread(target=self.flush_to_csv_loop)
+        self.writer_thread.start()
+
+        # ヘッダ書き込み
+        with open(self.output_file, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "tick", "timestamp",
+                "pressure_hPa", "temp_C",
+                "accel_x", "accel_y", "accel_z",
+                "gyro_x", "gyro_y", "gyro_z",
+                "euler_x", "euler_y", "euler_z"
+            ])
+
+    def read_bme280_loop(self):
+        while self.running:
+            try:
+                pressure = self.bme280.pressure
+                temperature = self.bme280.temperature
+                with self.data_lock:
+                    self.latest["pressure"] = pressure
+                    self.latest["temperature"] = temperature
+            except Exception as e:
+                print(f"[BME280] 読み取りエラー: {e}")
+            time.sleep(0.005) # ポーリング処理 200Hz
+
+
+    def read_bno055_loop(self):
+        while self.running:
+            try:
+                accel = self.bno055.acceleration or (None, None, None)
+                gyro = self.bno055.gyro or (None, None, None)
+                euler = self.bno055.euler or (None, None, None)
+                with self.data_lock:
+                    self.latest["accel"] = accel
+                    self.latest["gyro"] = gyro
+                    self.latest["euler"] = euler
+            except Exception as e:
+                print(f"[BNO055] 読み取りエラー: {e}")
+            time.sleep(0.005) # ポーリング処理 200Hz
+
+    def read_sensors(self, gpio, level, tick):
+        timestamp = time.time()
         try:
-            _debug(f"{pkg} version = {imm.version(pkg)}")
-        except imm.PackageNotFoundError:
-            _debug(f"Unable to determine {pkg} version via importlib.metadata")
+            with self.data_lock:
+                pressure = self.latest["pressure"]
+                temperature = self.latest["temperature"]
+                accel = self.latest["accel"]
+                gyro = self.latest["gyro"]
+                euler = self.latest["euler"]
 
-    _debug("Initialising I²C bus …")
-    i2c = busio.I2C(board.SCL, board.SDA)
+            row = [
+                self.tick, timestamp,
+                pressure, temperature,
+                *(accel or (None, None, None)),
+                *(gyro or (None, None, None)),
+                *(euler or (None, None, None))
+            ]
 
-    _debug("Waiting for I²C lock …")
-    while not i2c.try_lock():
-        pass
-    detected = [hex(addr) for addr in i2c.scan()]
-    _debug(f"I²C devices detected: {detected}")
-    i2c.unlock()
+            with self.lock:
+                self.buffer.append(row)
 
-    # Instantiate sensors
-    _debug(f"Creating BME280 instance at {hex(BME280_I2C_ADDR)} …")
-    bme280 = adafruit_bme280.Adafruit_BME280_I2C(i2c, address=BME280_I2C_ADDR)
+            self.tick += 1
+        except Exception as e:
+            print(f"[{self.tick}] 読み取りエラー: {e}")
 
-    _debug(f"Creating BNO055 instance at {hex(BNO055_I2C_ADDR)} …")
-    bno055 = BNO055_I2C(i2c, address=BNO055_I2C_ADDR)
-    _debug("Sensors initialised successfully.")
+    def flush_to_csv_loop(self):
+        while self.running:
+            time.sleep(self.flush_interval)
+            with self.lock:
+                rows = list(self.buffer)
+                self.buffer.clear()
+            if rows:
+                with open(self.output_file, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerows(rows)
 
-    print("Press Ctrl+C to stop…\n")
-    iteration = 0
-    while True:
-        iteration += 1
-        _debug(f"Reading sensors (iteration #{iteration}) …")
-
-        # BME280 readings
-        temp_c = bme280.temperature
-        humidity = bme280.humidity
-        pressure = bme280.pressure
-
-        # BNO055 acceleration
-        accel = bno055.acceleration
-        if accel is None:
-            _debug("Acceleration read returned None — sensor not ready?")
-            accel = (float("nan"),) * 3
-        ax, ay, az = accel
-
-        # Print consolidated line
-        print(
-            f"Temp: {temp_c:6.2f} °C  Hum: {humidity:6.2f} %  "
-            f"Pres: {pressure:7.2f} hPa  |  "
-            f"Accel X: {ax:7.2f} m/s²  Y: {ay:7.2f} m/s²  Z: {az:7.2f} m/s²"
-        )
-        print("=" * 100)
-
-        time.sleep(1)
+    def stop(self):
+        self.running = False
+        self.cb.cancel()
+        self.pi.hardware_PWM(self.output_pin, 0, 0)
+        self.writer_thread.join()
+        self.bme_thread.join()
+        self.bno_thread.join()
 
 
 if __name__ == "__main__":
-    _debug("Combined sensor test script starting …")
+    pi = pigpio.pi()
+    if not pi.connected:
+        print("pigpiod が起動していません")
+        exit()
+
+    # 現在時刻を使ってファイル名を生成
+    timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+    output_filename = f"sensor_log_{timestamp}.csv"
+    
+    reader = SensorReader(pi, freq=100, output_file=output_filename)
     try:
-        main()
+        print(f"記録を開始しました（ファイル: {output_filename}）")
+        time.sleep(RUN_TIME)
     except KeyboardInterrupt:
-        _debug("User interrupted execution with Ctrl+C. Exiting.")
+        print("終了処理中...")
+    finally:
+        reader.stop()
+        pi.stop()
