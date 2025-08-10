@@ -4,6 +4,7 @@ import board
 import csv
 import threading
 import collections
+import os
 from datetime import datetime, timedelta
 from adafruit_bme280 import basic as adafruit_bme280  # noqa: E402
 from adafruit_bno055 import BNO055_I2C  # noqa: E402
@@ -17,7 +18,7 @@ FLUSH_INTERVAL = 0.5  # sec
 SDA_PIN = 2
 SCL_PIN = 3
 I2C_BUS_ID = 1
-BME280_I2C_ADDR = 0x77
+BME280_I2C_ADDR = 0x76
 BNO055_I2C_ADDR = 0x28
 
 # GPIOピン定義
@@ -184,11 +185,10 @@ if __name__ == "__main__":
 
     # 現在時刻を使ってファイル名を生成
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    output_filename = f"sensor_log_{timestamp}.csv"
-    output_file = Path('results')
+    base_dir = Path(os.getcwd())
+    output_file = base_dir / 'results'
     output_file.mkdir(parents=True, exist_ok=True)
-    # output_file = output_file / output_filename
-    output_file = output_file / 'test.csv'
+    output_file = output_file / f"sensor_log_{timestamp}.csv"
 
     reader = SensorReader(pi, freq=100, output_file=output_file, flush_interval=FLUSH_INTERVAL)
     pi.set_mode(LED_PIN, pigpio.OUTPUT)
