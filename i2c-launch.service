@@ -1,0 +1,16 @@
+[Unit]
+Description=Run main.py when I2C devices 0x28 and 0x76 are detected
+After=multi-user.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/home/pi/Develop/fte-2025-rocket/start_when_i2c_ready.sh
+User=pi
+WorkingDirectory=/home/pi
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
